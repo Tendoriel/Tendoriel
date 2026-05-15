@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚔️ Vladislav / Tendoriel 👾
+# ⚔️ Tendor 👾
 
 ### Hobby Developer • Bot Tinkerer • Game Tools Enjoyer
 
