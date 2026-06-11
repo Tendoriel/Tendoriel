@@ -211,7 +211,7 @@ then fix them and call it experience.
 
 ---
 
-## 🛸 Оператор БПЛА / Drone Operator
+## 🛸 UAV Strike
 
 2D pixel-игра на чистом HTML5 Canvas — один файл, без зависимостей.
 

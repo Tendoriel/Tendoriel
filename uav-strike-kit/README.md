@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🛸 UAV Strike — Оператор БПЛА
+# 🛸 UAV Strike
 
-**2D pixel-art игра про оператора ударного дрона • чистый HTML5 Canvas • один файл • без зависимостей**
+**2D pixel-art игра про ударный дрон • чистый HTML5 Canvas • один файл • без зависимостей**
 
 *A 2D pixel-art FPV-drone game. Pure HTML5 Canvas, single file, zero dependencies.*
 
