@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Оператор БПЛА</title>
+<style>
+  html,body{margin:0;padding:0;background:#1a1410;height:100%;overflow:hidden;}
+  body{display:flex;align-items:center;justify-content:center;}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+// ============================================================
+//  ОПЕРАТОР БПЛА — 2D pixel top-down dodge'em-up
+//  Управление: WASD/стрелки, SHIFT/SPACE — рывок, ENTER — старт
+// ============================================================
+
+const W = 320, H = 240, TILE = 16, MAPW = 20; // map is exactly W wide
+const cvs = document.getElementById("game");
+cvs.width = W; cvs.height = H;
+const ctx = cvs.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+function fitScreen() {
+  const s = Math.max(1, Math.floor(Math.min(innerWidth / W, innerHeight / H)));
+  cvs.style.width = (W * s) + "px";
+  cvs.style.height = (H * s) + "px";
+}
+addEventListener("resize", fitScreen); fitScreen();
+
+// ---------- helpers ----------
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const irnd = (a, b) => Math.floor(rnd(a, b + 1));
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+const normAng = a => { a = (a + Math.PI) % (2 * Math.PI); if (a < 0) a += 2 * Math.PI; return a - Math.PI; };
+// deterministic per-cell hash for tile detail
+function hash2(x, y) { let h = (x * 374761393 + y * 668265263) | 0; h = (h ^ (h >> 13)) * 1274126177; return ((h ^ (h >> 16)) >>> 0) / 4294967296; }
+// crisp pixel circle (no anti-aliasing)
+function pixCircle(g, cx, cy, r, col) {
+  g.fillStyle = col;
+  for (let dy = -r; dy <= r; dy++) {
+    const dx = Math.floor(Math.sqrt(r * r - dy * dy));
+    g.fillRect(Math.round(cx - dx), Math.round(cy + dy), dx * 2 + 1, 1);
+  }
+}
+
+// ---------- palette (matched to the village-tileset mood) ----------
+const PAL = {
+  grass1: "#8fbe3f", grass2: "#86b53a", grassD: "#74a232",
+  path: "#d6914d", pathD: "#bd7a3c", pathL: "#e3a766", pathE: "#a4682f",
+  roof: "#6e81a0", roofD: "#586b8c", roofL: "#8a9cba", roofR: "#475877",
+  roof2: "#c4663a", roof2D: "#a04f2b", roof2L: "#d97f4e",
+  wall: "#f1ddb6", wallD: "#d9c298", timber: "#7c5230",
+  fence: "#c25a2a", fenceD: "#94401c",
+  tree: "#3f7d2b", treeL: "#549431", treeD: "#2f6420", trunk: "#7c5230",
+  rock: "#9aa0a8", rockD: "#777e88",
+  dirt: "#c08147", dirtD: "#a86c38",
+};
+
+// ---------- sprite builder ----------
+function makeSprite(rows, pal) {
+  const h = rows.length, w = rows[0].length;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ch = rows[y][x];
+    if (ch !== "." && ch !== " ") { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); }
+  }
+  return c;
+}
+
+const SPR = {};
+// quadcopter body (rotors are drawn dynamically)
+SPR.drone = makeSprite([
+  "a.........a",
+  ".a.......a.",
+  "..a.bbb.a..",
+  "...bbcbb...",
+  "...bcwcb...",
+  "...bbcbb...",
+  "..a.bbb.a..",
+  ".a.......a.",
+  "a.........a",
+], { a: "#3a3f4b", b: "#262a33", c: "#3a3f4b", w: "#6ee7ff" });
+
+SPR.sniper = makeSprite([
+  ".hh.",
+  ".hh.",
+  "gggg",
+  ".gg.",
+  ".g.g",
+], { h: "#e8b88a", g: "#4a5d33" });
+
+SPR.battery = makeSprite([
+  ".bbbb.",
+  "bwwywb",
+  "bwyywb",
+  "byywwb",
+  "bywwwb",
+  ".bbbb.",
+], { b: "#2c2c2c", w: "#ffd23e", y: "#fff6c8" });
+
+SPR.medkit = makeSprite([
+  "wwwwww",
+  "wwrrww",
+  "wrrrrw",
+  "wrrrrw",
+  "wwrrww",
+  "wwwwww",
+], { w: "#f2f2f2", r: "#d8392b" });
+
+// ---------- audio ----------
+let AC = null;
+function audio() { if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { } } return AC; }
+function beep(freq, dur, type, vol, slide) {
+  const a = audio(); if (!a) return;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || "square"; o.frequency.value = freq;
+  if (slide) o.frequency.exponentialRampToValueAtTime(slide, a.currentTime + dur);
+  g.gain.value = vol || 0.06;
+  g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+  o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+}
+function boomSfx(big) {
+  const a = audio(); if (!a) return;
+  const dur = big ? 0.9 : 0.35;
+  const buf = a.createBuffer(1, a.sampleRate * dur, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 1.6);
+  const src = a.createBufferSource(); src.buffer = buf;
+  const f = a.createBiquadFilter(); f.type = "lowpass"; f.frequency.value = big ? 900 : 1600;
+  const g = a.createGain(); g.gain.value = big ? 0.35 : 0.16;
+  src.connect(f); f.connect(g); g.connect(a.destination); src.start();
+}
+
+// ---------- input ----------
+const keys = {};
+let touchVec = null;
+addEventListener("keydown", e => {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+  keys[e.code] = true;
+  audio();
+  if (e.code === "Enter" || e.code === "NumpadEnter") menuAction();
+  if ((e.code === "Space" || e.code === "ShiftLeft" || e.code === "ShiftRight") && state === "play") dash();
+});
+addEventListener("keyup", e => { keys[e.code] = false; });
+cvs.addEventListener("touchstart", e => { e.preventDefault(); audio(); if (state !== "play") menuAction(); }, { passive: false });
+cvs.addEventListener("touchmove", e => {
+  e.preventDefault();
+  const t = e.touches[0], r = cvs.getBoundingClientRect();
+  const gx = (t.clientX - r.left) / r.width * W, gy = (t.clientY - r.top) / r.height * H;
+  touchVec = { x: gx, y: gy + camY };
+}, { passive: false });
+cvs.addEventListener("touchend", () => { touchVec = null; });
+
+// ---------- game state ----------
+let state = "menu";          // menu | play | boom | win | dead
+let level = 1;
+let best = +(localStorage.getItem("bpla_best") || 1);
+let deathReason = "";
+let stateT = 0;
+let shake = 0;
+let camY = 0;
+let mapHpx = 0;
+
+let drone, sams, helis, snipers, missiles, bullets, pickups, particles, target, houses, lockBeepT = 0;
+let mapCanvas = null;
+
+// ============================================================
+//  LEVEL GENERATION
+// ============================================================
+function genLevel(n) {
+  const MAPH = 70 + n * 10;
+  mapHpx = MAPH * TILE;
+  const occ = new Uint8Array(MAPW * MAPH);       // 0 free, 1 path, 2 building, 3 decor
+  const OC = (x, y) => occ[y * MAPW + x];
+  const setOC = (x, y, v) => { if (x >= 0 && x < MAPW && y >= 0 && y < MAPH) occ[y * MAPW + x] = v; };
+
+  // --- winding path from bottom to target ---
+  let px = irnd(7, 12);
+  const pathCells = [];
+  for (let y = MAPH - 1; y >= 4; y--) {
+    setOC(px, y, 1); setOC(px + 1, y, 1);
+    pathCells.push([px, y]);
+    if (Math.random() < 0.45) px = clamp(px + irnd(-1, 1), 2, MAPW - 4);
+  }
+
+  // --- target clearing at top ---
+  const tgx = clamp(px + 1, 4, MAPW - 5);
+  target = { x: tgx * TILE, y: 6 * TILE, hit: false, t: 0 };
+  for (let y = 2; y < 11; y++) for (let x = tgx - 4; x <= tgx + 4; x++) setOC(x, y, 2);
+
+  // --- houses ---
+  houses = [];
+  let tries = 0;
+  const wanted = 9 + Math.min(n, 6);
+  while (houses.length < wanted && tries++ < 400) {
+    const hw = irnd(3, 5), hh = irnd(3, 4);
+    const hx = irnd(1, MAPW - hw - 1), hy = irnd(12, MAPH - hh - 8);
+    let ok = true;
+    for (let y = hy - 1; y < hy + hh + 1 && ok; y++)
+      for (let x = hx - 1; x < hx + hw + 1 && ok; x++)
+        if (x < 0 || x >= MAPW || y < 0 || y >= MAPH || OC(x, y)) ok = false;
+    if (!ok) continue;
+    for (let y = hy; y < hy + hh; y++) for (let x = hx; x < hx + hw; x++) setOC(x, y, 2);
+    houses.push({ x: hx, y: hy, w: hw, h: hh, alt: Math.random() < 0.3 });
+  }
+
+  // --- decorations on the prerendered map ---
+  mapCanvas = document.createElement("canvas");
+  mapCanvas.width = W; mapCanvas.height = mapHpx;
+  const g = mapCanvas.getContext("2d");
+  g.imageSmoothingEnabled = false;
+
+  // grass
+  for (let y = 0; y < MAPH; y++) for (let x = 0; x < MAPW; x++) {
+    const h = hash2(x, y);
+    g.fillStyle = h < 0.5 ? PAL.grass1 : PAL.grass2;
+    g.fillRect(x * TILE, y * TILE, TILE, TILE);
+    // speckles
+    for (let i = 0; i < 3; i++) {
+      const hx2 = hash2(x * 7 + i, y * 13 + i);
+      const hy2 = hash2(x * 31 + i, y * 3 + i);
+      g.fillStyle = hx2 < 0.5 ? PAL.grassD : "#9cc94e";
+      g.fillRect(x * TILE + ((hx2 * 14) | 0), y * TILE + ((hy2 * 14) | 0), 2, 1);
+    }
+    if (hash2(x * 3 + 5, y * 5 + 1) > 0.93 && !OC(x, y)) { // flowers
+      g.fillStyle = ["#ffd23e", "#f2f2f2", "#e88aa0"][(hash2(x, y * 9) * 3) | 0];
+      g.fillRect(x * TILE + 6, y * TILE + 6, 2, 2);
+      g.fillRect(x * TILE + 10, y * TILE + 9, 2, 2);
+    }
+  }
+  // path (cobbled, with darker edge)
+  for (const [x, y] of pathCells) for (let w2 = 0; w2 < 2; w2++) {
+    const tx = (x + w2) * TILE, ty = y * TILE;
+    g.fillStyle = PAL.path; g.fillRect(tx, ty, TILE, TILE);
+    for (let i = 0; i < 4; i++) {
+      const h1 = hash2(tx + i * 3, ty + i * 7), h2 = hash2(ty + i * 5, tx + i);
+      g.fillStyle = h1 < 0.5 ? PAL.pathD : PAL.pathL;
+      g.fillRect(tx + ((h1 * 12) | 0), ty + ((h2 * 12) | 0), 3, 2);
+    }
+  }
+  // path edges
+  for (let y = 0; y < MAPH; y++) for (let x = 0; x < MAPW; x++) {
+    if (OC(x, y) !== 1) continue;
+    g.fillStyle = PAL.pathE;
+    if (x === 0 || OC(x - 1, y) !== 1) g.fillRect(x * TILE, y * TILE, 1, TILE);
+    if (x === MAPW - 1 || OC(x + 1, y) !== 1) g.fillRect(x * TILE + TILE - 1, y * TILE, 1, TILE);
+  }
+
+  // houses
+  for (const hs of houses) drawHouse(g, hs);
+
+  // fences (short rows on free grass)
+  for (let i = 0; i < 6 + n; i++) {
+    const len = irnd(3, 6), fx = irnd(0, MAPW - len), fy = irnd(12, MAPH - 6);
+    let ok = true;
+    for (let x = fx; x < fx + len; x++) if (OC(x, fy)) ok = false;
+    if (!ok) continue;
+    for (let x = fx; x < fx + len; x++) setOC(x, fy, 3);
+    drawFence(g, fx * TILE, fy * TILE + 4, len * TILE);
+  }
+
+  // trees / bushes / rocks
+  const freeSpot = () => {
+    for (let t = 0; t < 60; t++) {
+      const x = irnd(0, MAPW - 1), y = irnd(2, MAPH - 3);
+      if (!OC(x, y)) return [x, y];
+    }
+    return null;
+  };
+  for (let i = 0; i < MAPH * 0.9; i++) {
+    const s = freeSpot(); if (!s) break;
+    const [x, y] = s; setOC(x, y, 3);
+    const r = Math.random();
+    if (r < 0.55) drawTree(g, x * TILE + 8, y * TILE + 8);
+    else if (r < 0.8) drawBush(g, x * TILE + 8, y * TILE + 10);
+    else drawRock(g, x * TILE + 8, y * TILE + 10);
+  }
+
+  // target depot
+  drawDepot(g, target.x, target.y);
+
+  // --- enemies ---
+  sams = []; helis = []; snipers = []; missiles = []; bullets = []; pickups = []; particles = [];
+  const safeY = mapHpx - 110;   // no enemies right at spawn
+
+  const samCount = 2 + n;
+  for (let i = 0; i < samCount; i++) {
+    const s = freeSpot(); if (!s) break;
+    const [x, y] = s;
+    const py = y * TILE + 8;
+    if (py > safeY || py < 12 * TILE) { i--; continue; }
+    setOC(x, y, 3);
+    sams.push({
+      x: x * TILE + 8, y: py, cd: rnd(0.5, 2.5),
+      range: 95 + n * 4, reload: Math.max(2.0, 3.6 - n * 0.18), blink: Math.random() * 2
+    });
+    drawSamPad(g, x * TILE + 8, py);
+  }
+
+  const heliCount = 1 + Math.floor(n / 2);
+  for (let i = 0; i < heliCount; i++) {
+    const hy = rnd(14 * TILE, safeY - 40);
+    helis.push({
+      x: rnd(60, W - 60), y: hy, baseY: hy, dir: Math.random() < 0.5 ? -1 : 1,
+      x0: 30, x1: W - 30, speed: 26 + n * 3, rot: 0, bt: rnd(0.5, 1.5), burst: 3, bob: Math.random() * 6
+    });
+  }
+
+  // snipers on roofs
+  const snipCount = Math.min(houses.length, 2 + n);
+  const pool = houses.slice().sort(() => Math.random() - 0.5);
+  for (let i = 0; i < snipCount; i++) {
+    const hs = pool[i]; if (!hs) break;
+    const sx = (hs.x + rnd(0.8, hs.w - 0.8)) * TILE;
+    const sy = (hs.y + rnd(0.6, hs.h - 1.4)) * TILE;
+    if (sy > safeY) continue;
+    snipers.push({
+      x: sx, y: sy, st: 0, t: 0, ang: 0,
+      range: 105 + n * 5, aimT: Math.max(0.55, 1.25 - n * 0.07), flash: 0
+    });
+  }
+
+  // pickups along the way
+  for (let y = 20; y < MAPH - 8; y += irnd(14, 20)) {
+    const s = freeSpot(); if (!s) continue;
+    pickups.push({ x: s[0] * TILE + 8, y: y * TILE + rnd(-16, 16), kind: Math.random() < 0.7 ? "bat" : "med", bob: Math.random() * 6 });
+  }
+
+  // --- drone spawn ---
+  drone = {
+    x: W / 2, y: mapHpx - 30, vx: 0, vy: 0, hp: 3, inv: 0,
+    bat: 100, batTime: 55 + n * 10, rotor: 0,
+    dashT: 0, dashCD: 0
+  };
+  camY = mapHpx - H;
+  lockBeepT = 0;
+}
+
+// ---------- map-piece painters ----------
+function drawHouse(g, hs) {
+  const x = hs.x * TILE, y = hs.y * TILE, w = hs.w * TILE, h = hs.h * TILE;
+  const R = hs.alt ? PAL.roof2 : PAL.roof, RD = hs.alt ? PAL.roof2D : PAL.roofD,
+    RL = hs.alt ? PAL.roof2L : PAL.roofL, RR = hs.alt ? "#83401f" : PAL.roofR;
+  const wallH = 10;
+  // front wall
+  g.fillStyle = PAL.wall; g.fillRect(x + 1, y + h - wallH, w - 2, wallH);
+  g.fillStyle = PAL.wallD; g.fillRect(x + 1, y + h - 3, w - 2, 3);
+  // timber framing
+  g.fillStyle = PAL.timber;
+  for (let i = 0; i <= hs.w; i++) g.fillRect(x + 1 + Math.min(i * TILE, w - 4), y + h - wallH, 2, wallH);
+  g.fillRect(x + 1, y + h - wallH, w - 2, 2);
+  // door + window
+  g.fillStyle = "#5e3c20"; g.fillRect(x + w / 2 - 3, y + h - 8, 6, 8);
+  g.fillStyle = "#8fd3e8"; g.fillRect(x + 5, y + h - 8, 4, 4);
+  if (w > 48) { g.fillRect(x + w - 9, y + h - 8, 4, 4); }
+  // roof
+  const ry = y - 4, rh = h - wallH + 4;
+  g.fillStyle = RD; g.fillRect(x - 2, ry, w + 4, rh);
+  g.fillStyle = R; g.fillRect(x - 2, ry, w + 4, rh - 3);
+  // shingle rows
+  g.fillStyle = RD;
+  for (let yy = ry + 4; yy < ry + rh - 3; yy += 4) g.fillRect(x - 2, yy, w + 4, 1);
+  g.fillStyle = RL; g.fillRect(x - 2, ry, w + 4, 2);
+  g.fillStyle = RR; g.fillRect(x - 2, ry + rh - 1, w + 4, 1);
+  // chimney
+  if (hs.w >= 4) {
+    g.fillStyle = "#8d8d95"; g.fillRect(x + w - 12, ry + 3, 6, 7);
+    g.fillStyle = "#6e6e76"; g.fillRect(x + w - 12, ry + 3, 6, 2);
+  }
+}
+function drawFence(g, x, y, len) {
+  g.fillStyle = PAL.fenceD; g.fillRect(x, y + 3, len, 2);
+  g.fillStyle = PAL.fence; g.fillRect(x, y + 1, len, 2);
+  for (let i = 0; i < len; i += 6) {
+    g.fillStyle = PAL.fence; g.fillRect(x + i, y - 2, 3, 8);
+    g.fillStyle = PAL.fenceD; g.fillRect(x + i, y + 5, 3, 1);
+  }
+}
+function drawTree(g, cx, cy) {
+  g.fillStyle = "rgba(0,0,0,0.15)";
+  g.fillRect(cx - 5, cy + 5, 11, 3);
+  g.fillStyle = PAL.trunk; g.fillRect(cx - 1, cy + 2, 3, 4);
+  pixCircle(g, cx, cy - 1, 6, PAL.treeD);
+  pixCircle(g, cx - 1, cy - 2, 5, PAL.tree);
+  pixCircle(g, cx - 2, cy - 3, 3, PAL.treeL);
+  g.fillStyle = PAL.treeD; g.fillRect(cx + 1, cy - 1, 2, 1);
+}
+function drawBush(g, cx, cy) {
+  pixCircle(g, cx, cy, 4, PAL.treeD);
+  pixCircle(g, cx - 1, cy - 1, 3, PAL.tree);
+  g.fillStyle = PAL.treeL; g.fillRect(cx - 2, cy - 2, 2, 1);
+}
+function drawRock(g, cx, cy) {
+  pixCircle(g, cx, cy, 3, PAL.rockD);
+  pixCircle(g, cx - 1, cy - 1, 2, PAL.rock);
+}
+function drawSamPad(g, x, y) {
+  g.fillStyle = PAL.dirt; g.fillRect(x - 10, y - 8, 21, 17);
+  g.fillStyle = PAL.dirtD;
+  g.fillRect(x - 10, y - 8, 21, 1); g.fillRect(x - 10, y + 8, 21, 1);
+  g.fillRect(x - 10, y - 8, 1, 17); g.fillRect(x + 10, y - 8, 1, 17);
+}
+function drawDepot(g, x, y) {
+  // dirt clearing
+  pixCircle(g, x, y, 38, PAL.dirt);
+  pixCircle(g, x, y, 34, PAL.dirtD);
+  pixCircle(g, x, y, 33, PAL.dirt);
+  // sandbag ring
+  g.fillStyle = "#b3a060";
+  g.fillRect(x - 26, y - 20, 52, 4); g.fillRect(x - 26, y + 16, 52, 4);
+  g.fillRect(x - 26, y - 20, 4, 40); g.fillRect(x + 22, y - 20, 4, 40);
+  // bunker
+  g.fillStyle = "#7e8489"; g.fillRect(x - 16, y - 12, 32, 24);
+  g.fillStyle = "#969ca2"; g.fillRect(x - 16, y - 12, 32, 18);
+  g.fillStyle = "#5e6468"; g.fillRect(x - 16, y - 12, 32, 2);
+  g.fillStyle = "#3c4044"; g.fillRect(x - 4, y + 4, 8, 8);
+  // red star
+  g.fillStyle = "#d8392b";
+  g.fillRect(x - 1, y - 8, 2, 8); g.fillRect(x - 4, y - 6, 8, 2);
+  g.fillRect(x - 3, y - 3, 2, 2); g.fillRect(x + 1, y - 3, 2, 2);
+  // barrels
+  for (const [bx, by] of [[-22, -2], [22, 6], [20, -10], [-20, 10]]) {
+    g.fillStyle = "#54683a"; g.fillRect(x + bx - 2, y + by - 3, 5, 7);
+    g.fillStyle = "#6d8449"; g.fillRect(x + bx - 2, y + by - 3, 5, 2);
+  }
+}
+
+// ============================================================
+//  UPDATE
+// ============================================================
+let last = performance.now();
+function loop(now) {
+  let dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  stateT += dt;
+  if (state === "play") update(dt);
+  if (state === "boom") updateBoom(dt);
+  if (state === "dead" || state === "win") updateParticles(dt);
+  render(dt);
+  requestAnimationFrame(loop);
+}
+
+function dash() {
+  if (drone.dashCD > 0 || drone.bat <= 0) return;
+  const sp = Math.hypot(drone.vx, drone.vy);
+  if (sp < 10) return;
+  const k = 260 / sp;
+  drone.vx *= k; drone.vy *= k;
+  drone.dashT = 0.16; drone.dashCD = 1.8;
+  drone.bat = Math.max(0, drone.bat - 2);
+  beep(700, 0.12, "sawtooth", 0.05, 200);
+  for (let i = 0; i < 6; i++) spawnPart(drone.x, drone.y, rnd(-30, 30), rnd(-30, 30), 0.3, "#bfe9ff", 1);
+}
+
+function damageDrone(n) {
+  if (drone.inv > 0 || state !== "play") return;
+  drone.hp -= n; drone.inv = 1.2; shake = 5;
+  boomSfx(false);
+  for (let i = 0; i < 12; i++) spawnPart(drone.x, drone.y, rnd(-70, 70), rnd(-70, 70), 0.5, i % 2 ? "#ffb347" : "#ff5e2b", 2);
+  if (drone.hp <= 0) die("БПЛА СБИТ");
+}
+function die(reason) {
+  deathReason = reason;
+  state = "dead"; stateT = 0; shake = 8;
+  boomSfx(true);
+  for (let i = 0; i < 40; i++) spawnPart(drone.x, drone.y, rnd(-120, 120), rnd(-120, 120), rnd(0.4, 1.1), ["#ff5e2b", "#ffb347", "#fff1ad", "#555"][i % 4], irnd(1, 3));
+}
+
+function update(dt) {
+  const d = drone;
+  // --- controls ---
+  let ax = 0, ay = 0;
+  if (keys.KeyA || keys.ArrowLeft) ax -= 1;
+  if (keys.KeyD || keys.ArrowRight) ax += 1;
+  if (keys.KeyW || keys.ArrowUp) ay -= 1;
+  if (keys.KeyS || keys.ArrowDown) ay += 1;
+  if (touchVec) {
+    const dx = touchVec.x - d.x, dy = touchVec.y - d.y;
+    const l = Math.hypot(dx, dy);
+    if (l > 6) { ax = dx / l; ay = dy / l; }
+  }
+  const ACC = 420, MAX = 100;
+  d.vx += ax * ACC * dt; d.vy += ay * ACC * dt;
+  d.vx -= d.vx * 3.2 * dt; d.vy -= d.vy * 3.2 * dt;
+  if (d.dashT > 0) d.dashT -= dt;
+  else {
+    const sp = Math.hypot(d.vx, d.vy);
+    if (sp > MAX) { d.vx *= MAX / sp; d.vy *= MAX / sp; }
+  }
+  d.x = clamp(d.x + d.vx * dt, 5, W - 5);
+  d.y = clamp(d.y + d.vy * dt, 5, mapHpx - 5);
+  d.rotor += dt * 40;
+  if (d.inv > 0) d.inv -= dt;
+  if (d.dashCD > 0) d.dashCD -= dt;
+
+  // battery
+  d.bat -= dt / d.batTime * 100;
+  if (d.bat <= 0) { d.bat = 0; die("БАТАРЕЯ РАЗРЯЖЕНА"); return; }
+
+  // camera
+  camY = clamp(d.y - H * 0.55, 0, mapHpx - H);
+  if (shake > 0) shake = Math.max(0, shake - dt * 14);
+
+  const active = e => Math.abs(e.y - d.y) < H + 80;
+
+  // --- SAM sites ---
+  for (const s of sams) {
+    s.blink += dt;
+    if (!active(s)) continue;
+    s.cd -= dt;
+    if (s.cd <= 0 && dist2(s.x, s.y, d.x, d.y) < s.range * s.range) {
+      s.cd = s.reload;
+      missiles.push({
+        x: s.x, y: s.y - 4, ang: Math.atan2(d.y - s.y, d.x - s.x),
+        speed: 30, max: 95 + level * 7, turn: 2.0 + level * 0.18, life: 6
+      });
+      beep(180, 0.25, "sawtooth", 0.08, 60);
+    }
+  }
+  // --- missiles ---
+  for (let i = missiles.length - 1; i >= 0; i--) {
+    const m = missiles[i];
+    m.life -= dt;
+    m.speed = Math.min(m.max, m.speed + 160 * dt);
+    const want = Math.atan2(d.y - m.y, d.x - m.x);
+    const diff = normAng(want - m.ang);
+    m.ang += clamp(diff, -m.turn * dt, m.turn * dt);
+    m.x += Math.cos(m.ang) * m.speed * dt;
+    m.y += Math.sin(m.ang) * m.speed * dt;
+    spawnPart(m.x - Math.cos(m.ang) * 4, m.y - Math.sin(m.ang) * 4, rnd(-8, 8), rnd(-8, 8), 0.35, Math.random() < 0.5 ? "#ffb347" : "#9a9a9a", 1);
+    if (dist2(m.x, m.y, d.x, d.y) < 49) { missiles.splice(i, 1); damageDrone(1); continue; }
+    if (m.life <= 0 || m.x < -10 || m.x > W + 10 || m.y < -10 || m.y > mapHpx + 10) {
+      for (let j = 0; j < 8; j++) spawnPart(m.x, m.y, rnd(-50, 50), rnd(-50, 50), 0.4, "#ffb347", 2);
+      boomSfx(false);
+      missiles.splice(i, 1);
+    }
+  }
+  // --- helicopters ---
+  for (const h of helis) {
+    if (!active(h)) continue;
+    h.x += h.dir * h.speed * dt;
+    if (h.x < h.x0) { h.x = h.x0; h.dir = 1; }
+    if (h.x > h.x1) { h.x = h.x1; h.dir = -1; }
+    h.bob += dt; h.y = h.baseY + Math.sin(h.bob * 2) * 4;
+    h.rot += dt * 30;
+    if (dist2(h.x, h.y, d.x, d.y) < 120 * 120) {
+      h.bt -= dt;
+      if (h.bt <= 0) {
+        if (h.burst > 0) {
+          h.burst--; h.bt = 0.13;
+          const a = Math.atan2(d.y - h.y, d.x - h.x) + rnd(-0.12, 0.12);
+          bullets.push({ x: h.x, y: h.y, vx: Math.cos(a) * 130, vy: Math.sin(a) * 130, life: 1.6 });
+          beep(900, 0.05, "square", 0.04, 300);
+        } else { h.burst = 3; h.bt = Math.max(0.8, 1.7 - level * 0.07); }
+      }
+    }
+    if (dist2(h.x, h.y, d.x, d.y) < 100) damageDrone(1); // collision with heli
+  }
+  // --- snipers ---
+  for (const s of snipers) {
+    if (s.flash > 0) s.flash -= dt;
+    if (!active(s)) { s.st = 0; continue; }
+    const dd = dist2(s.x, s.y, d.x, d.y);
+    if (s.st === 0) {
+      if (dd < s.range * s.range) { s.st = 1; s.t = s.aimT; }
+    } else if (s.st === 1) {
+      s.ang = Math.atan2(d.y - s.y, d.x - s.x);
+      s.t -= dt;
+      if (dd > s.range * s.range * 1.7) { s.st = 0; continue; }
+      if (s.t <= 0) {
+        bullets.push({ x: s.x, y: s.y, vx: Math.cos(s.ang) * 250, vy: Math.sin(s.ang) * 250, life: 1.0 });
+        s.st = 2; s.t = 2.4; s.flash = 0.1;
+        beep(1400, 0.09, "square", 0.07, 200);
+      }
+    } else { s.t -= dt; if (s.t <= 0) s.st = 0; }
+  }
+  // --- bullets ---
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (dist2(b.x, b.y, d.x, d.y) < 25) { bullets.splice(i, 1); damageDrone(1); continue; }
+    if (b.life <= 0) bullets.splice(i, 1);
+  }
+  // --- pickups ---
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.bob += dt;
+    if (dist2(p.x, p.y, d.x, d.y) < 100) {
+      if (p.kind === "bat") { d.bat = Math.min(100, d.bat + 25); beep(880, 0.12, "square", 0.06, 1320); }
+      else { d.hp = Math.min(3, d.hp + 1); beep(660, 0.15, "triangle", 0.07, 990); }
+      pickups.splice(i, 1);
+    }
+  }
+  // --- lock warning ---
+  let danger = false;
+  for (const m of missiles) if (dist2(m.x, m.y, d.x, d.y) < 90 * 90) danger = true;
+  if (danger) {
+    lockBeepT -= dt;
+    if (lockBeepT <= 0) { lockBeepT = 0.22; beep(1100, 0.07, "square", 0.05); }
+  }
+
+  updateParticles(dt);
+
+  // --- target reached ---
+  target.t += dt;
+  if (dist2(d.x, d.y, target.x, target.y) < 18 * 18) {
+    state = "boom"; stateT = 0; shake = 9;
+    boomSfx(true);
+    for (let i = 0; i < 70; i++)
+      spawnPart(target.x + rnd(-14, 14), target.y + rnd(-12, 12), rnd(-150, 150), rnd(-150, 150), rnd(0.5, 1.4), ["#ff5e2b", "#ffb347", "#fff1ad", "#5e5e5e", "#d8392b"][i % 5], irnd(1, 4));
+  }
+}
+
+function updateBoom(dt) {
+  updateParticles(dt);
+  if (stateT > 0.25 && stateT < 1.1 && Math.random() < 0.35) {
+    boomSfx(false);
+    for (let i = 0; i < 12; i++)
+      spawnPart(target.x + rnd(-22, 22), target.y + rnd(-18, 18), rnd(-90, 90), rnd(-110, 30), rnd(0.4, 1.0), ["#ff5e2b", "#ffb347", "#555"][i % 3], irnd(1, 3));
+    shake = Math.max(shake, 5);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 10);
+  if (stateT > 1.8) {
+    state = "win"; stateT = 0;
+    if (level + 1 > best) { best = level + 1; localStorage.setItem("bpla_best", best); }
+  }
+}
+
+// ---------- particles ----------
+function spawnPart(x, y, vx, vy, life, col, size) {
+  particles.push({ x, y, vx, vy, life, max: life, col, size });
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 1 - 2 * dt; p.vy *= 1 - 2 * dt;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 12);
+}
+
+// ---------- menu actions ----------
+function menuAction() {
+  if (state === "menu") { level = 1; genLevel(level); state = "play"; stateT = 0; }
+  else if (state === "win") { level++; genLevel(level); state = "play"; stateT = 0; }
+  else if (state === "dead" && stateT > 0.6) { genLevel(level); state = "play"; stateT = 0; }
+}
+
+// ============================================================
+//  RENDER
+// ============================================================
+function render(dt) {
+  ctx.fillStyle = "#222";
+  ctx.fillRect(0, 0, W, H);
+  if (state === "menu") { renderMenu(); return; }
+
+  ctx.save();
+  const sx = shake > 0 ? rnd(-shake, shake) : 0;
+  const sy = shake > 0 ? rnd(-shake, shake) : 0;
+  ctx.translate(Math.round(sx), Math.round(sy));
+  const cy = Math.round(camY);
+
+  // map slice
+  ctx.drawImage(mapCanvas, 0, cy, W, H, 0, 0, W, H);
+
+  // target marker (pulsing)
+  if (!target.hit && state === "play") {
+    const ty = target.y - cy;
+    if (ty > -50 && ty < H + 50) {
+      const pl = 14 + Math.sin(target.t * 5) * 3;
+      ctx.strokeStyle = "rgba(255,60,40,0.85)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(Math.round(target.x - pl), Math.round(ty - pl), pl * 2, pl * 2);
+      ctx.fillStyle = "rgba(255,60,40,0.85)";
+      ctx.fillRect(target.x - 1, ty - pl - 4, 2, 4); ctx.fillRect(target.x - 1, ty + pl, 2, 4);
+      ctx.fillRect(target.x - pl - 4, ty - 1, 4, 2); ctx.fillRect(target.x + pl, ty - 1, 4, 2);
+    }
+  }
+  // pickups
+  for (const p of pickups) {
+    const py = p.y - cy + Math.sin(p.bob * 3) * 2;
+    if (py < -10 || py > H + 10) continue;
+    ctx.drawImage(p.kind === "bat" ? SPR.battery : SPR.medkit, Math.round(p.x - 3), Math.round(py - 3));
+  }
+  // SAM launchers
+  for (const s of sams) {
+    const py = s.y - cy;
+    if (py < -20 || py > H + 20) continue;
+    ctx.fillStyle = "#4a5d33"; ctx.fillRect(s.x - 6, py - 4, 13, 9);
+    ctx.fillStyle = "#5d7440"; ctx.fillRect(s.x - 6, py - 4, 13, 3);
+    // missile tubes
+    ctx.fillStyle = "#39482a";
+    ctx.fillRect(s.x - 4, py - 7, 3, 6); ctx.fillRect(s.x, py - 8, 3, 7); ctx.fillRect(s.x + 4, py - 7, 3, 6);
+    ctx.fillStyle = "#7e8489";
+    ctx.fillRect(s.x - 4, py - 7, 3, 1); ctx.fillRect(s.x, py - 8, 3, 1); ctx.fillRect(s.x + 4, py - 7, 3, 1);
+    // radar blink
+    ctx.fillStyle = Math.sin(s.blink * 6) > 0 ? "#ff4030" : "#701810";
+    ctx.fillRect(s.x + 5, py + 2, 2, 2);
+  }
+  // snipers + lasers
+  for (const s of snipers) {
+    const py = s.y - cy;
+    if (py < -16 || py > H + 16) continue;
+    if (s.st === 1 && state === "play") {
+      const a = 0.25 + 0.45 * (1 - s.t / s.aimT) + Math.random() * 0.1;
+      ctx.strokeStyle = "rgba(255,40,40," + a.toFixed(2) + ")";
+      ctx.beginPath();
+      ctx.moveTo(s.x, py);
+      ctx.lineTo(drone.x, drone.y - cy);
+      ctx.stroke();
+    }
+    ctx.drawImage(SPR.sniper, Math.round(s.x - 2), Math.round(py - 2));
+    if (s.flash > 0) { ctx.fillStyle = "#fff1ad"; ctx.fillRect(s.x - 3, py - 3, 8, 8); }
+  }
+  // shadows of flying things
+  ctx.fillStyle = "rgba(0,0,0,0.22)";
+  for (const h of helis) {
+    const py = h.y - cy;
+    if (py < -30 || py > H + 30) continue;
+    ctx.fillRect(Math.round(h.x - 8), Math.round(py + 12), 16, 4);
+  }
+  if (state === "play") ctx.fillRect(Math.round(drone.x - 4), Math.round(drone.y - cy + 9), 9, 3);
+
+  // bullets
+  ctx.fillStyle = "#fff1ad";
+  for (const b of bullets) {
+    const py = b.y - cy;
+    if (py < -5 || py > H + 5) continue;
+    ctx.fillRect(Math.round(b.x - 1), Math.round(py - 1), 2, 2);
+  }
+  // missiles
+  for (const m of missiles) {
+    const py = m.y - cy;
+    if (py < -10 || py > H + 10) continue;
+    ctx.save();
+    ctx.translate(Math.round(m.x), Math.round(py));
+    ctx.rotate(m.ang);
+    ctx.fillStyle = "#c9ced4"; ctx.fillRect(-4, -1, 8, 3);
+    ctx.fillStyle = "#d8392b"; ctx.fillRect(2, -1, 2, 3);
+    ctx.fillStyle = "#ffb347"; ctx.fillRect(-6, 0, 2, 1);
+    ctx.restore();
+  }
+  // helicopters
+  for (const h of helis) {
+    const py = h.y - cy;
+    if (py < -30 || py > H + 30) continue;
+    drawHeli(h, py);
+  }
+  // drone
+  if (state === "play" || state === "boom") {
+    if (!(drone.inv > 0 && Math.sin(drone.inv * 30) > 0)) drawDrone(drone.x, drone.y - cy);
+  }
+  // particles
+  for (const p of particles) {
+    const py = p.y - cy;
+    if (py < -5 || py > H + 5) continue;
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x - p.size / 2), Math.round(py - p.size / 2), p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // boom whiteout
+  if (state === "boom" && stateT < 0.3) {
+    ctx.fillStyle = "rgba(255,245,220," + (1 - stateT / 0.3).toFixed(2) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  renderHUD();
+  if (state === "win") renderWin();
+  if (state === "dead") renderDead();
+}
+
+function drawDrone(x, y) {
+  x = Math.round(x); y = Math.round(y);
+  ctx.drawImage(SPR.drone, x - 5, y - 4);
+  // spinning rotors at the four arms
+  ctx.strokeStyle = "rgba(40,44,52,0.75)";
+  for (const [ox, oy] of [[-5, -4], [5, -4], [-5, 4], [5, 4]]) {
+    const a = drone.rotor + ox * 0.7;
+    ctx.beginPath();
+    ctx.moveTo(x + ox - Math.cos(a) * 3, y + oy - Math.sin(a) * 3);
+    ctx.lineTo(x + ox + Math.cos(a) * 3, y + oy + Math.sin(a) * 3);
+    ctx.stroke();
+  }
+}
+function drawHeli(h, py) {
+  const x = Math.round(h.x), y = Math.round(py);
+  ctx.save();
+  ctx.translate(x, y);
+  if (h.dir < 0) ctx.scale(-1, 1);
+  // tail
+  ctx.fillStyle = "#54683a"; ctx.fillRect(-14, -1, 10, 3);
+  ctx.fillStyle = "#6d8449"; ctx.fillRect(-14, -1, 10, 1);
+  // tail rotor
+  ctx.fillStyle = "#39482a"; ctx.fillRect(-16, -3, 2, 7);
+  // body
+  ctx.fillStyle = "#54683a"; ctx.fillRect(-5, -4, 13, 9);
+  ctx.fillStyle = "#6d8449"; ctx.fillRect(-5, -4, 13, 3);
+  ctx.fillStyle = "#39482a"; ctx.fillRect(-5, 3, 13, 2);
+  // cockpit
+  ctx.fillStyle = "#8fd3e8"; ctx.fillRect(4, -3, 4, 4);
+  // skids
+  ctx.fillStyle = "#2c2c2c"; ctx.fillRect(-4, 6, 11, 1);
+  ctx.restore();
+  // main rotor
+  ctx.strokeStyle = "rgba(30,34,26,0.7)";
+  ctx.beginPath();
+  ctx.moveTo(x - Math.cos(h.rot) * 13, y - 2 - Math.sin(h.rot) * 5);
+  ctx.lineTo(x + Math.cos(h.rot) * 13, y - 2 + Math.sin(h.rot) * 5);
+  ctx.stroke();
+}
+
+// ---------- HUD ----------
+function txt(s, x, y, col, size, align) {
+  ctx.fillStyle = col || "#e8f4e8";
+  ctx.font = (size || 8) + "px monospace";
+  ctx.textAlign = align || "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(s, x, y);
+}
+function renderHUD() {
+  // FPV corner brackets
+  ctx.strokeStyle = "rgba(220,255,220,0.5)";
+  ctx.lineWidth = 1;
+  const c = 10, m2 = 6;
+  ctx.beginPath();
+  ctx.moveTo(m2, m2 + c); ctx.lineTo(m2, m2); ctx.lineTo(m2 + c, m2);
+  ctx.moveTo(W - m2 - c, m2); ctx.lineTo(W - m2, m2); ctx.lineTo(W - m2, m2 + c);
+  ctx.moveTo(m2, H - m2 - c); ctx.lineTo(m2, H - m2); ctx.lineTo(m2 + c, H - m2);
+  ctx.moveTo(W - m2 - c, H - m2); ctx.lineTo(W - m2, H - m2); ctx.lineTo(W - m2, H - m2 - c);
+  ctx.stroke();
+
+  const distM = Math.max(0, Math.round((drone.y - target.y) / 4));
+  txt("УР. " + level, 10, 10, "#d8ffd8");
+  txt("ЦЕЛЬ " + distM + "м", 10, 20, "#d8ffd8");
+  // REC
+  if (Math.sin(stateT * 4) > 0) { ctx.fillStyle = "#ff4030"; ctx.fillRect(W - 44, 11, 4, 4); }
+  txt("REC", W - 36, 10, "#ffd0c8");
+
+  // battery
+  ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.fillRect(9, H - 19, 64, 10);
+  ctx.strokeStyle = "#d8ffd8"; ctx.strokeRect(10.5, H - 17.5, 50, 7);
+  ctx.fillRect(61.5, H - 15.5, 2, 3);
+  const bw = Math.round(48 * drone.bat / 100);
+  ctx.fillStyle = drone.bat > 30 ? "#7ad03e" : (Math.sin(stateT * 8) > 0 ? "#ff4030" : "#a02818");
+  ctx.fillRect(12, H - 16, bw, 5);
+  txt(Math.ceil(drone.bat) + "%", 76, H - 18, "#d8ffd8");
+
+  // HP
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < drone.hp ? "#ff5e5e" : "rgba(255,255,255,0.18)";
+    const hx = W - 16 - i * 10, hy = H - 18;
+    ctx.fillRect(hx, hy + 1, 3, 3); ctx.fillRect(hx + 4, hy + 1, 3, 3);
+    ctx.fillRect(hx, hy + 3, 7, 2); ctx.fillRect(hx + 1, hy + 5, 5, 1); ctx.fillRect(hx + 2, hy + 6, 3, 1); ctx.fillRect(hx + 3, hy + 7, 1, 1);
+  }
+  // dash cooldown
+  if (state === "play") {
+    txt("РЫВОК", W - 90, H - 18, drone.dashCD <= 0 ? "#9fe5ff" : "rgba(160,200,220,0.35)");
+  }
+  // missile lock warning
+  let danger = false;
+  if (missiles) for (const mm of missiles) if (dist2(mm.x, mm.y, drone.x, drone.y) < 8100) danger = true;
+  if (danger && Math.sin(stateT * 12) > 0) {
+    txt("! ЗАХВАТ !", W / 2, 16, "#ff4030", 10, "center");
+  }
+  // target arrow if offscreen above
+  if (state === "play" && target.y < camY - 10) {
+    ctx.fillStyle = "rgba(255,80,60,0.8)";
+    const axx = Math.round(target.x);
+    ctx.fillRect(axx - 1, 28, 2, 6);
+    ctx.fillRect(axx - 3, 30, 6, 2);
+    ctx.fillRect(axx - 2, 29, 4, 2);
+  }
+}
+
+function panel(h2) {
+  ctx.fillStyle = "rgba(10,14,10,0.78)";
+  ctx.fillRect(30, H / 2 - h2 / 2, W - 60, h2);
+  ctx.strokeStyle = "#7ad03e";
+  ctx.strokeRect(30.5, H / 2 - h2 / 2 + 0.5, W - 61, h2 - 1);
+}
+function renderWin() {
+  panel(70);
+  txt("ЦЕЛЬ ПОРАЖЕНА", W / 2, H / 2 - 26, "#7ad03e", 12, "center");
+  txt("Уровень " + level + " пройден", W / 2, H / 2 - 8, "#d8ffd8", 8, "center");
+  txt("Дальше будет сложнее...", W / 2, H / 2 + 4, "#9ab89a", 8, "center");
+  if (Math.sin(stateT * 4) > 0) txt("ENTER / тап — уровень " + (level + 1), W / 2, H / 2 + 20, "#fff1ad", 8, "center");
+}
+function renderDead() {
+  // signal-loss static
+  for (let i = 0; i < 300; i++) {
+    ctx.fillStyle = "rgba(255,255,255," + rnd(0.02, 0.12).toFixed(2) + ")";
+    ctx.fillRect(irnd(0, W - 3), irnd(0, H - 2), irnd(1, 3), 1);
+  }
+  panel(74);
+  txt("ПОТЕРЯ СИГНАЛА", W / 2, H / 2 - 28, "#ff5e5e", 12, "center");
+  txt(deathReason, W / 2, H / 2 - 10, "#ffd0c8", 8, "center");
+  txt("Уровень " + level, W / 2, H / 2 + 2, "#9ab89a", 8, "center");
+  if (stateT > 0.6 && Math.sin(stateT * 4) > 0) txt("ENTER / тап — повторить", W / 2, H / 2 + 18, "#fff1ad", 8, "center");
+}
+
+// ---------- menu ----------
+let menuT = 0;
+function renderMenu() {
+  menuT += 0.016;
+  // scrolling grass backdrop
+  const off = Math.floor((menuT * 1.5 % 1) * TILE);
+  for (let y = 0; y < H / TILE + 1; y++) for (let x = 0; x < W / TILE; x++) {
+    const wy = y + Math.floor(menuT * 1.5);
+    ctx.fillStyle = hash2(x, wy) < 0.5 ? PAL.grass1 : PAL.grass2;
+    ctx.fillRect(x * TILE, y * TILE - off, TILE, TILE);
+    if (hash2(x * 3, wy * 5) > 0.9) {
+      ctx.fillStyle = PAL.grassD;
+      ctx.fillRect(x * TILE + 5, y * TILE - off + 7, 3, 2);
+    }
+  }
+  ctx.fillStyle = "rgba(8,12,8,0.55)";
+  ctx.fillRect(0, 0, W, H);
+
+  // title plate
+  ctx.fillStyle = "#2b2440"; ctx.fillRect(50, 26, W - 100, 44);
+  ctx.fillStyle = "#3a3158"; ctx.fillRect(50, 26, W - 100, 4);
+  ctx.strokeStyle = "#7ad03e"; ctx.strokeRect(50.5, 26.5, W - 101, 43);
+  txt("ОПЕРАТОР БПЛА", W / 2, 34, "#fff1ad", 16, "center");
+  txt("миссия: уничтожить склад противника", W / 2, 54, "#bfe9ff", 8, "center");
+
+  // demo drone
+  const dx = W / 2 + Math.sin(menuT * 1.3) * 60, dy = 96 + Math.sin(menuT * 2.2) * 6;
+  ctx.fillStyle = "rgba(0,0,0,0.25)"; ctx.fillRect(Math.round(dx - 4), Math.round(dy + 10), 9, 3);
+  ctx.drawImage(SPR.drone, Math.round(dx - 5), Math.round(dy - 4));
+  ctx.strokeStyle = "rgba(40,44,52,0.75)";
+  for (const [ox, oy] of [[-5, -4], [5, -4], [-5, 4], [5, 4]]) {
+    const a = menuT * 40 + ox;
+    ctx.beginPath();
+    ctx.moveTo(dx + ox - Math.cos(a) * 3, dy + oy - Math.sin(a) * 3);
+    ctx.lineTo(dx + ox + Math.cos(a) * 3, dy + oy + Math.sin(a) * 3);
+    ctx.stroke();
+  }
+
+  txt("WASD / стрелки — полёт", W / 2, 124, "#d8ffd8", 8, "center");
+  txt("SHIFT / SPACE — рывок (уклонение)", W / 2, 136, "#d8ffd8", 8, "center");
+  txt("Долети до цели. Избегай ПВО,", W / 2, 152, "#9ab89a", 8, "center");
+  txt("вертолётов и снайперов.", W / 2, 162, "#9ab89a", 8, "center");
+  txt("Следи за зарядом батареи!", W / 2, 172, "#9ab89a", 8, "center");
+  if (best > 1) txt("Рекорд: уровень " + best, W / 2, 190, "#ffd23e", 8, "center");
+  if (Math.sin(menuT * 4) > 0) txt("ENTER / тап — начать", W / 2, 208, "#fff1ad", 10, "center");
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
